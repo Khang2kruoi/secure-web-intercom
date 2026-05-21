@@ -5,3 +5,4 @@ __pycache__/
 certs/
 *.pdf
 extracted_pdf_text.txt
+AGENTS.md
