@@ -6,3 +6,5 @@ certs/
 *.pdf
 extracted_pdf_text.txt
 AGENTS.md
+conference_101719.tex
+ref.bib
