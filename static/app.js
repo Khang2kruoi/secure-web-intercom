@@ -2,7 +2,6 @@ const TARGET_SAMPLE_RATE = 16000;
 const AUDIO_PACKET_MAGIC = [0x53, 0x57, 0x49, 0x31]; // "SWI1"
 const AUDIO_PACKET_HEADER_BYTES = 20;
 const MIN_PLAYBACK_LEAD_SECONDS = 0.02;
-const LATE_DROP_THRESHOLD_SECONDS = 0.12;
 const MAX_PLAYBACK_QUEUE_SECONDS = 0.5;
 const QOS_PING_INTERVAL_MS = 2000;
 
@@ -407,22 +406,10 @@ function playPcm16(arrayBuffer) {
     return;
   }
   const pcm = new Int16Array(arrayBuffer);
-  const outputLength =
-    audioContext.sampleRate === TARGET_SAMPLE_RATE
-      ? pcm.length
-      : Math.ceil((pcm.length * audioContext.sampleRate) / TARGET_SAMPLE_RATE);
-  const audioBuffer = audioContext.createBuffer(1, outputLength, audioContext.sampleRate);
+  const audioBuffer = audioContext.createBuffer(1, pcm.length, TARGET_SAMPLE_RATE);
   const channel = audioBuffer.getChannelData(0);
-  if (audioContext.sampleRate === TARGET_SAMPLE_RATE) {
-    for (let i = 0; i < pcm.length; i += 1) {
-      channel[i] = pcm[i] / 32768;
-    }
-  } else {
-    const ratio = TARGET_SAMPLE_RATE / audioContext.sampleRate;
-    for (let i = 0; i < outputLength; i += 1) {
-      const sourceIndex = Math.min(Math.floor(i * ratio), pcm.length - 1);
-      channel[i] = pcm[sourceIndex] / 32768;
-    }
+  for (let i = 0; i < pcm.length; i += 1) {
+    channel[i] = pcm[i] / 32768;
   }
 
   const node = audioContext.createBufferSource();
@@ -435,16 +422,13 @@ function playPcm16(arrayBuffer) {
     metrics.bufferUnderrunSeconds += underrunSeconds;
     metrics.maxBufferUnderrunMs = Math.max(metrics.maxBufferUnderrunMs, underrunSeconds * 1000);
     nextPlaybackTime = now + MIN_PLAYBACK_LEAD_SECONDS;
-    if (underrunSeconds > LATE_DROP_THRESHOLD_SECONDS) {
-      metrics.lateDroppedPackets += 1;
-      return;
-    }
   }
 
   const queuedSeconds = Math.max(0, nextPlaybackTime - now);
   if (queuedSeconds > MAX_PLAYBACK_QUEUE_SECONDS) {
     metrics.queueOverflowDroppedPackets += 1;
     metrics.lateDroppedPackets += 1;
+    nextPlaybackTime = now + MIN_PLAYBACK_LEAD_SECONDS;
     return;
   }
 

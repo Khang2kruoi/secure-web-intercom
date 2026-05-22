@@ -4,7 +4,7 @@ import time
 from openpyxl import load_workbook
 
 from web_intercom.metrics import estimate_e_model
-from web_intercom.server import WebIntercomServer, audio_payload_size, build_arg_parser, create_app, load_room_key
+from web_intercom.server import Client, WebIntercomServer, audio_payload_size, build_arg_parser, create_app, load_room_key
 
 
 def test_parser_defaults():
@@ -45,6 +45,62 @@ def test_audio_packet_header_validation():
     assert audio_payload_size(b"SWI1" + b"\x00" * 16 + b"pcm") == 3
     assert audio_payload_size(b"BAD!" + b"\x00" * 16 + b"pcm") is None
     assert audio_payload_size(b"SWI1") is None
+
+
+def test_handle_audio_does_not_block_on_slow_recipient():
+    class SlowWebSocket:
+        async def send_bytes(self, data: bytes) -> None:
+            await asyncio.sleep(1)
+
+    async def run() -> None:
+        relay = WebIntercomServer("secret")
+        sender_ws = object()
+        slow_ws = SlowWebSocket()
+        sender = Client(sender_ws, "client-0001", "alice", "main", time.monotonic())
+        slow = Client(slow_ws, "client-0002", "bob", "main", time.monotonic())
+        relay.clients[sender_ws] = sender
+        relay.clients[slow_ws] = slow
+        packet = b"SWI1" + b"\x00" * 16 + b"pcm"
+
+        started_at = time.perf_counter()
+        await relay.handle_audio(sender, packet)
+        elapsed = time.perf_counter() - started_at
+        await asyncio.sleep(0.05)
+        sample = relay.metrics.sample([])
+
+        assert elapsed < 0.05
+        assert sample["rx_audio_packets"] == 1
+        assert sample["relay_send_drops"] == 1
+
+    asyncio.run(run())
+
+
+def test_broadcast_presence_skips_broken_client():
+    class BrokenWebSocket:
+        async def send_json(self, message: dict) -> None:
+            raise RuntimeError("Cannot write to closing transport")
+
+    class HealthyWebSocket:
+        def __init__(self) -> None:
+            self.messages = []
+
+        async def send_json(self, message: dict) -> None:
+            self.messages.append(message)
+
+    async def run() -> None:
+        relay = WebIntercomServer("secret")
+        broken_ws = BrokenWebSocket()
+        healthy_ws = HealthyWebSocket()
+        relay.clients[broken_ws] = Client(broken_ws, "client-0001", "bad", "main", time.monotonic())
+        relay.clients[healthy_ws] = Client(healthy_ws, "client-0002", "good", "main", time.monotonic())
+
+        await relay.broadcast_presence("main")
+
+        assert healthy_ws.messages == [
+            {"type": "presence", "room": "main", "count": 2, "clients": ["bad", "good"]}
+        ]
+
+    asyncio.run(run())
 
 
 def test_e_model_degrades_with_delay_and_late_drop():
