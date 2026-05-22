@@ -134,6 +134,44 @@ def test_handle_audio_drops_when_recipient_relay_queue_is_full():
     asyncio.run(run())
 
 
+def test_relay_worker_survives_unexpected_send_exception():
+    class FlakyWebSocket:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.sent = []
+
+        async def send_bytes(self, data: bytes) -> None:
+            self.calls += 1
+            if self.calls == 1:
+                raise ValueError("unexpected transport state")
+            self.sent.append(data)
+
+    async def run() -> None:
+        relay = WebIntercomServer("secret")
+        websocket = FlakyWebSocket()
+        recipient = Client(websocket, "client-0002", "bob", "main", time.monotonic())
+        relay.start_relay_worker(recipient)
+        first = b"SWI1" + b"\x00" * 16 + b"one"
+        second = b"SWI1" + b"\x00" * 16 + b"two"
+
+        try:
+            recipient.relay_queue.put_nowait((first, 3))
+            await asyncio.wait_for(recipient.relay_queue.join(), timeout=1)
+            assert recipient.relay_worker is not None
+            assert not recipient.relay_worker.done()
+            recipient.relay_queue.put_nowait((second, 3))
+            await asyncio.wait_for(recipient.relay_queue.join(), timeout=1)
+            sample = relay.metrics.sample([])
+        finally:
+            await relay.stop_relay_worker(recipient)
+
+        assert websocket.sent == [second]
+        assert sample["relay_send_drops"] == 1
+        assert sample["relayed_packets"] == 1
+
+    asyncio.run(run())
+
+
 def test_broadcast_presence_skips_broken_client():
     class BrokenWebSocket:
         async def send_json(self, message: dict) -> None:
@@ -164,6 +202,35 @@ def test_broadcast_presence_skips_broken_client():
                 "active_stream_ids": [],
             }
         ]
+
+    asyncio.run(run())
+
+
+def test_broadcast_presence_does_not_wait_for_slow_client():
+    class SlowWebSocket:
+        async def send_json(self, message: dict) -> None:
+            await asyncio.sleep(1)
+
+    class HealthyWebSocket:
+        def __init__(self) -> None:
+            self.messages = []
+
+        async def send_json(self, message: dict) -> None:
+            self.messages.append(message)
+
+    async def run() -> None:
+        relay = WebIntercomServer("secret")
+        slow_ws = SlowWebSocket()
+        healthy_ws = HealthyWebSocket()
+        relay.clients[slow_ws] = Client(slow_ws, "client-0001", "slow", "main", time.monotonic())
+        relay.clients[healthy_ws] = Client(healthy_ws, "client-0002", "good", "main", time.monotonic())
+
+        started_at = time.perf_counter()
+        await relay.broadcast_presence("main")
+        elapsed = time.perf_counter() - started_at
+
+        assert elapsed < 0.5
+        assert healthy_ws.messages[-1]["clients"] == ["good", "slow"]
 
     asyncio.run(run())
 
@@ -264,6 +331,29 @@ def test_metrics_workbook_contains_processed_sheets(tmp_path):
     assert workbook["Client Summary"]["A4"].value == "client_id"
     assert workbook["Samples"]["A4"].value == "timestamp"
     assert workbook["Metric Guide"]["A4"].value == "Source"
+
+
+def test_qos_summary_late_drop_rate_uses_received_denominator(tmp_path):
+    relay = WebIntercomServer("secret")
+    relay.metrics.record_join("client-0001", "alice", "main", time.monotonic())
+    relay.metrics.record_client_metrics(
+        "client-0001",
+        {
+            "received_packets": 10,
+            "late_dropped_packets": 2,
+            "playback_queue_seconds": 0,
+            "estimated_owd_ms": 0,
+            "callback_interval_mean_ms": 8,
+        },
+    )
+    relay.metrics.sample([("client-0001", "alice", "main")])
+    output = tmp_path / "qos_drop_rate.xlsx"
+
+    relay.metrics.write_workbook(output)
+
+    sheet = load_workbook(output, data_only=True)["QoS Summary"]
+    values = {row[0].value: row[1].value for row in sheet.iter_rows(min_row=5, max_col=2)}
+    assert values["Late drop rate"] == 20
 
 
 def test_async_workbook_writer_uses_picklable_snapshot(tmp_path):

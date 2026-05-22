@@ -386,14 +386,10 @@ function parseAudioPacket(arrayBuffer) {
 function updateRfc3550Jitter(packet) {
   const arrivalTimeMs = performance.now();
   const state = getRemoteStreamState(packet.streamId);
-  if (state.lastSequence !== null) {
-    const expected = (state.lastSequence + 1) >>> 0;
-    if (packet.sequence !== expected) {
-      const forwardGap = (packet.sequence - expected) >>> 0;
-      metrics.networkLossPackets += forwardGap > 0 && forwardGap < 0x80000000 ? forwardGap : 1;
-    }
+  const isForwardPacket = updateSequenceTracking(state, packet.sequence);
+  if (!isForwardPacket) {
+    return;
   }
-  state.lastSequence = packet.sequence;
 
   const transitMs = arrivalTimeMs - packet.captureTimeMs;
   if (state.previousTransitMs !== null) {
@@ -405,6 +401,25 @@ function updateRfc3550Jitter(packet) {
     0,
     ...Array.from(remoteStreams.values(), (stream) => stream.jitterMs),
   );
+}
+
+function updateSequenceTracking(state, sequence) {
+  if (state.lastSequence !== null) {
+    const expected = (state.lastSequence + 1) >>> 0;
+    if (sequence === expected) {
+      state.lastSequence = sequence;
+      return true;
+    }
+    const forwardGap = (sequence - expected) >>> 0;
+    if (forwardGap > 0 && forwardGap < 0x80000000) {
+      metrics.networkLossPackets += forwardGap;
+      state.lastSequence = sequence;
+      return true;
+    }
+    return false;
+  }
+  state.lastSequence = sequence;
+  return true;
 }
 
 function getRemoteStreamState(streamId) {

@@ -118,7 +118,7 @@ The browser also sends WebSocket QoS pings. The workbook reports `estimated_owd_
 
 Playback scheduling is tracked per remote stream. It flushes an overgrown stream queue instead of waiting for stale buffered audio to drain. When a stream queue is flushed, scheduled `AudioBufferSourceNode` instances for that stream are stopped so stale audio cannot overlap with newly scheduled packets. After silence or network gaps longer than 100 ms, the next received audio packet is treated as a fresh talk burst, so the beginning of speech is not discarded and silence is not counted as a buffer underrun.
 
-Sequence gaps are reported as `network_loss_packets`, but they are not counted as late drops by themselves. `late_dropped_packets` only increases when the browser actually discards a packet because the per-stream playback queue budget was exceeded.
+Sequence gaps are reported as `network_loss_packets`, but only forward sequence jumps are counted. Reordered or stale packets do not move the stream baseline backward or add fake loss. Sequence gaps are not counted as late drops by themselves; `late_dropped_packets` only increases when the browser actually discards a packet because the per-stream playback queue budget was exceeded.
 
 Presence messages include `active_stream_ids`, allowing browsers to remove state and scheduled audio nodes for streams that have left the room.
 
@@ -141,7 +141,7 @@ New-NetFirewallRule -DisplayName "Secure Web Intercom HTTPS 8443" -Direction Inb
 - Audio capture uses `AudioWorklet` instead of the deprecated `ScriptProcessorNode`, so capture work is isolated from the browser UI thread.
 - The client requests `AudioContext({ sampleRate: 16000 })`. If the actual `AudioContext.sampleRate` differs, captured audio is resampled to 16 kHz with `OfflineAudioContext` before transmission. Received PCM16 is placed in a 16 kHz `AudioBuffer` so the browser performs playback resampling instead of nearest-neighbor JavaScript scaling.
 - Audio packets carry stream ID, sequence number, and capture timestamp fields so browsers can measure jitter, late drops, buffer underruns, and callback stability.
-- Server relay sends are isolated per recipient with a bounded 4-packet relay queue and short send timeout. If a recipient queue is full, new packets for that recipient are dropped immediately instead of allowing hidden backlog growth.
+- Server relay sends are isolated per recipient with a bounded 4-packet relay queue and short send timeout. If a recipient queue is full, new packets for that recipient are dropped immediately instead of allowing hidden backlog growth. Presence updates are also sent with bounded concurrent writes so one slow browser cannot delay the whole room update.
 - Audio is still sent as uncompressed PCM16 over WebSocket/TCP. This is simple and measurable, but Wi-Fi loss or congestion can increase latency because TCP preserves order.
 
 ## Roadmap

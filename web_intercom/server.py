@@ -29,6 +29,7 @@ AUDIO_PACKET_MAGIC = b"SWI1"
 AUDIO_PACKET_HEADER_BYTES = 20
 AUDIO_RELAY_SEND_TIMEOUT_SECONDS = 0.02
 RELAY_QUEUE_MAX_PACKETS = 4
+PRESENCE_SEND_TIMEOUT_SECONDS = 0.1
 STATIC_DIR_KEY = web.AppKey("static_dir", Path)
 
 
@@ -172,6 +173,9 @@ class WebIntercomServer:
                 delivered = await self.send_audio_to_recipient(recipient, data, payload_size)
                 if not delivered:
                     self.drop_queued_audio(recipient)
+            except Exception:
+                self.metrics.inc("relay_send_drops")
+                self.drop_queued_audio(recipient)
             finally:
                 recipient.relay_queue.task_done()
 
@@ -258,11 +262,14 @@ class WebIntercomServer:
             "clients": names,
             "active_stream_ids": active_stream_ids,
         }
-        for client in clients:
-            try:
+        await asyncio.gather(*(self.send_presence(client, message) for client in clients))
+
+    async def send_presence(self, client: Client, message: dict[str, object]) -> None:
+        try:
+            async with asyncio.timeout(PRESENCE_SEND_TIMEOUT_SECONDS):
                 await client.websocket.send_json(message)
-            except Exception:
-                continue
+        except Exception:
+            return
 
     async def stats_loop(self, interval: float, metrics_xlsx: str | None) -> None:
         while True:
