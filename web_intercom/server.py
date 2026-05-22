@@ -37,6 +37,7 @@ class Client:
     room: str
     joined_at: float
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    send_pending: bool = field(default=False, repr=False)
 
 
 class WebIntercomServer:
@@ -125,18 +126,24 @@ class WebIntercomServer:
         self.metrics.record_audio_in(len(data), payload_size)
         recipients = await self.room_recipient_clients(sender.room, exclude=sender.websocket)
         for recipient in recipients:
+            if recipient.send_pending or recipient.send_lock.locked():
+                self.metrics.inc("relay_send_drops")
+                continue
+            recipient.send_pending = True
             task = asyncio.create_task(self.send_audio_to_recipient(recipient, data, payload_size))
             self.relay_tasks.add(task)
             task.add_done_callback(self.relay_tasks.discard)
 
     async def send_audio_to_recipient(self, recipient: Client, data: bytes, payload_size: int) -> None:
         try:
-            async with asyncio.timeout(AUDIO_RELAY_SEND_TIMEOUT_SECONDS):
-                async with recipient.send_lock:
+            async with recipient.send_lock:
+                async with asyncio.timeout(AUDIO_RELAY_SEND_TIMEOUT_SECONDS):
                     await recipient.websocket.send_bytes(data)
             self.metrics.record_audio_relay(len(data), payload_size)
         except (asyncio.TimeoutError, ConnectionError, RuntimeError):
             self.metrics.inc("relay_send_drops")
+        finally:
+            recipient.send_pending = False
 
     async def handle_text(self, sender: Client, data: str) -> None:
         try:

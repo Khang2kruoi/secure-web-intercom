@@ -7,6 +7,7 @@ This is the browser-client version of the secure LAN voice intercom. Client mach
 - The Python server serves a browser UI over HTTPS.
 - Browsers connect through WebSocket Secure (`wss://`).
 - Each browser captures microphone audio with `AudioWorklet`, requests a 16 kHz `AudioContext`, converts frames to PCM16, and sends them to the server.
+- Each browser keeps an independent playout clock per remote stream, so simultaneous talkers are mixed by the Web Audio graph instead of being serialized into one global queue.
 - The server relays each client's audio to the other clients in the same room, with per-recipient send timeouts so one slow browser does not stall the whole room.
 - Transport security comes from HTTPS/WSS. A room key is required before a client can join.
 
@@ -113,7 +114,9 @@ J = J + (|D(i,j)| - J) / 16
 
 The browser also sends WebSocket QoS pings. The workbook reports `estimated_owd_ms` as `RTT / 2`, which is a practical LAN approximation that avoids requiring synchronized clocks between client machines. Treat it as an estimate, not a hardware timestamp measurement.
 
-Playback scheduling flushes an overgrown queue instead of waiting for stale buffered audio to drain. After silence or network gaps, the next received audio packet is treated as a fresh playout burst so the beginning of speech is not discarded.
+Playback scheduling is tracked per remote stream. It flushes an overgrown stream queue instead of waiting for stale buffered audio to drain. After silence or network gaps longer than 100 ms, the next received audio packet is treated as a fresh talk burst, so the beginning of speech is not discarded and silence is not counted as a buffer underrun.
+
+Sequence gaps are used for stream timing analysis, but they are not counted as late drops by themselves. `late_dropped_packets` only increases when the browser actually discards a packet because the per-stream playback queue budget was exceeded.
 
 For IEEE-style experiments, run the same scenario under controlled network conditions and compare results. Useful scenarios include normal LAN, added delay, added packet loss, and congested Wi-Fi. The current media path is WebSocket/TCP with PCM16; it is intentionally measurable but can accumulate delay under loss because TCP preserves ordering.
 
@@ -134,7 +137,7 @@ New-NetFirewallRule -DisplayName "Secure Web Intercom HTTPS 8443" -Direction Inb
 - Audio capture uses `AudioWorklet` instead of the deprecated `ScriptProcessorNode`, so capture work is isolated from the browser UI thread.
 - The client requests `AudioContext({ sampleRate: 16000 })`, and received PCM16 is placed in a 16 kHz `AudioBuffer` so the browser performs playback resampling instead of nearest-neighbor JavaScript scaling.
 - Audio packets carry stream ID, sequence number, and capture timestamp fields so browsers can measure jitter, late drops, buffer underruns, and callback stability.
-- Server relay sends are isolated per recipient with short timeouts; slow or broken clients may miss packets without blocking other clients.
+- Server relay sends are isolated per recipient with short timeouts. If a recipient already has a pending send, the next packet for that recipient is dropped immediately instead of creating a hidden task queue.
 - Audio is still sent as uncompressed PCM16 over WebSocket/TCP. This is simple and measurable, but Wi-Fi loss or congestion can increase latency because TCP preserves order.
 
 ## Roadmap

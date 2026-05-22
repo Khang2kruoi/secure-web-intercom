@@ -75,6 +75,32 @@ def test_handle_audio_does_not_block_on_slow_recipient():
     asyncio.run(run())
 
 
+def test_handle_audio_drops_when_recipient_send_is_pending():
+    class HealthyWebSocket:
+        async def send_bytes(self, data: bytes) -> None:
+            raise AssertionError("send should not be scheduled while pending")
+
+    async def run() -> None:
+        relay = WebIntercomServer("secret")
+        sender_ws = object()
+        recipient_ws = HealthyWebSocket()
+        sender = Client(sender_ws, "client-0001", "alice", "main", time.monotonic())
+        recipient = Client(recipient_ws, "client-0002", "bob", "main", time.monotonic())
+        recipient.send_pending = True
+        relay.clients[sender_ws] = sender
+        relay.clients[recipient_ws] = recipient
+        packet = b"SWI1" + b"\x00" * 16 + b"pcm"
+
+        await relay.handle_audio(sender, packet)
+        sample = relay.metrics.sample([])
+
+        assert len(relay.relay_tasks) == 0
+        assert sample["rx_audio_packets"] == 1
+        assert sample["relay_send_drops"] == 1
+
+    asyncio.run(run())
+
+
 def test_broadcast_presence_skips_broken_client():
     class BrokenWebSocket:
         async def send_json(self, message: dict) -> None:

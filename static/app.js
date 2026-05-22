@@ -2,6 +2,7 @@ const TARGET_SAMPLE_RATE = 16000;
 const AUDIO_PACKET_MAGIC = [0x53, 0x57, 0x49, 0x31]; // "SWI1"
 const AUDIO_PACKET_HEADER_BYTES = 20;
 const MIN_PLAYBACK_LEAD_SECONDS = 0.02;
+const TALK_BURST_RESET_SECONDS = 0.1;
 const MAX_PLAYBACK_QUEUE_SECONDS = 0.5;
 const QOS_PING_INTERVAL_MS = 2000;
 
@@ -22,7 +23,6 @@ let mediaStream = null;
 let sourceNode = null;
 let workletNode = null;
 let silenceGainNode = null;
-let nextPlaybackTime = 0;
 let qosPingTimer = null;
 let streamId = createStreamId();
 let sequence = 0;
@@ -186,7 +186,7 @@ async function connect() {
     metrics.receivedPackets += 1;
     metrics.packets += 1;
     updateRfc3550Jitter(packet);
-    playPcm16(packet.payload);
+    playPcm16(packet);
   });
 
   socket.addEventListener("close", () => {
@@ -328,7 +328,7 @@ function disconnect(closeSocket = true) {
     audioContext.close();
     audioContext = null;
   }
-  nextPlaybackTime = 0;
+  remoteStreams = new Map();
   joinButton.disabled = false;
   leaveButton.disabled = true;
   setStatus("Disconnected", false);
@@ -372,21 +372,7 @@ function parseAudioPacket(arrayBuffer) {
 
 function updateRfc3550Jitter(packet) {
   const arrivalTimeMs = performance.now();
-  let state = remoteStreams.get(packet.streamId);
-  if (!state) {
-    state = {
-      previousTransitMs: null,
-      jitterMs: 0,
-      lastSequence: null,
-    };
-    remoteStreams.set(packet.streamId, state);
-  }
-  if (state.lastSequence !== null) {
-    const expected = (state.lastSequence + 1) >>> 0;
-    if (packet.sequence !== expected) {
-      metrics.lateDroppedPackets += 1;
-    }
-  }
+  const state = getRemoteStreamState(packet.streamId);
   state.lastSequence = packet.sequence;
 
   const transitMs = arrivalTimeMs - packet.captureTimeMs;
@@ -401,11 +387,26 @@ function updateRfc3550Jitter(packet) {
   );
 }
 
-function playPcm16(arrayBuffer) {
+function getRemoteStreamState(streamId) {
+  let state = remoteStreams.get(streamId);
+  if (!state) {
+    state = {
+      previousTransitMs: null,
+      jitterMs: 0,
+      lastSequence: null,
+      nextPlaybackTime: 0,
+    };
+    remoteStreams.set(streamId, state);
+  }
+  return state;
+}
+
+function playPcm16(packet) {
   if (!audioContext) {
     return;
   }
-  const pcm = new Int16Array(arrayBuffer);
+  const state = getRemoteStreamState(packet.streamId);
+  const pcm = new Int16Array(packet.payload);
   const audioBuffer = audioContext.createBuffer(1, pcm.length, TARGET_SAMPLE_RATE);
   const channel = audioBuffer.getChannelData(0);
   for (let i = 0; i < pcm.length; i += 1) {
@@ -416,25 +417,27 @@ function playPcm16(arrayBuffer) {
   node.buffer = audioBuffer;
   node.connect(audioContext.destination);
   const now = audioContext.currentTime;
-  if (nextPlaybackTime > 0 && now > nextPlaybackTime) {
-    const underrunSeconds = now - nextPlaybackTime;
+  if (state.nextPlaybackTime === 0 || now > state.nextPlaybackTime + TALK_BURST_RESET_SECONDS) {
+    state.nextPlaybackTime = now + MIN_PLAYBACK_LEAD_SECONDS;
+  } else if (now > state.nextPlaybackTime) {
+    const underrunSeconds = now - state.nextPlaybackTime;
     metrics.bufferUnderrunEvents += 1;
     metrics.bufferUnderrunSeconds += underrunSeconds;
     metrics.maxBufferUnderrunMs = Math.max(metrics.maxBufferUnderrunMs, underrunSeconds * 1000);
-    nextPlaybackTime = now + MIN_PLAYBACK_LEAD_SECONDS;
+    state.nextPlaybackTime = now + MIN_PLAYBACK_LEAD_SECONDS;
   }
 
-  const queuedSeconds = Math.max(0, nextPlaybackTime - now);
+  const queuedSeconds = Math.max(0, state.nextPlaybackTime - now);
   if (queuedSeconds > MAX_PLAYBACK_QUEUE_SECONDS) {
     metrics.queueOverflowDroppedPackets += 1;
     metrics.lateDroppedPackets += 1;
-    nextPlaybackTime = now + MIN_PLAYBACK_LEAD_SECONDS;
+    state.nextPlaybackTime = now + MIN_PLAYBACK_LEAD_SECONDS;
     return;
   }
 
-  const startAt = Math.max(now + MIN_PLAYBACK_LEAD_SECONDS, nextPlaybackTime);
+  const startAt = Math.max(now + MIN_PLAYBACK_LEAD_SECONDS, state.nextPlaybackTime);
   node.start(startAt);
-  nextPlaybackTime = startAt + audioBuffer.duration;
+  state.nextPlaybackTime = startAt + audioBuffer.duration;
   metrics.playedPackets += 1;
 }
 
@@ -447,7 +450,7 @@ function sendBrowserMetrics() {
   if (!socket || socket.readyState !== WebSocket.OPEN) {
     return;
   }
-  const playbackQueueSeconds = audioContext ? Math.max(0, nextPlaybackTime - audioContext.currentTime) : 0;
+  const playbackQueueSeconds = currentPlaybackQueueSeconds();
   const sessionDurationSeconds = Math.max(0, (performance.now() - metrics.connectedAtMs) / 1000);
   socket.send(
     JSON.stringify({
@@ -483,5 +486,16 @@ function sendBrowserMetrics() {
         playback_queue_seconds: Number(playbackQueueSeconds.toFixed(3)),
       },
     }),
+  );
+}
+
+function currentPlaybackQueueSeconds() {
+  if (!audioContext) {
+    return 0;
+  }
+  const now = audioContext.currentTime;
+  return Math.max(
+    0,
+    ...Array.from(remoteStreams.values(), (stream) => Math.max(0, stream.nextPlaybackTime - now)),
   );
 }
