@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -24,6 +25,11 @@ from .metrics import WebIntercomMetrics, write_metrics_workbook
 
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8443
+MAX_CLIENTS = 20
+MAX_OPEN_CONNECTIONS = 40
+MAX_CONNECTIONS_PER_IP = 8
+MAX_AUTH_FAILURES_PER_IP = 5
+AUTH_FAILURE_WINDOW_SECONDS = 60.0
 MAX_AUDIO_FRAME_BYTES = 64_000
 AUDIO_PACKET_MAGIC = b"SWI1"
 AUDIO_PACKET_HEADER_BYTES = 20
@@ -49,11 +55,27 @@ class Client:
 
 
 class WebIntercomServer:
-    def __init__(self, room_key: str):
+    def __init__(
+        self,
+        room_key: str,
+        max_clients: int = MAX_CLIENTS,
+        max_open_connections: int = MAX_OPEN_CONNECTIONS,
+        max_connections_per_ip: int = MAX_CONNECTIONS_PER_IP,
+        max_auth_failures_per_ip: int = MAX_AUTH_FAILURES_PER_IP,
+        auth_failure_window_seconds: float = AUTH_FAILURE_WINDOW_SECONDS,
+    ):
         if not room_key:
             raise ValueError("room key cannot be empty")
         self.room_key = room_key
+        self.max_clients = max_clients
+        self.max_open_connections = max_open_connections
+        self.max_connections_per_ip = max_connections_per_ip
+        self.max_auth_failures_per_ip = max_auth_failures_per_ip
+        self.auth_failure_window_seconds = auth_failure_window_seconds
         self.clients: dict[web.WebSocketResponse, Client] = {}
+        self.open_connections = 0
+        self.open_connections_by_ip: defaultdict[str, int] = defaultdict(int)
+        self.auth_failures_by_ip: defaultdict[str, deque[float]] = defaultdict(deque)
         self.lock = asyncio.Lock()
         self.metrics = WebIntercomMetrics()
         self.relay_tasks: set[asyncio.Task[None]] = set()
@@ -63,11 +85,15 @@ class WebIntercomServer:
         return web.FileResponse(request.app[STATIC_DIR_KEY] / "index.html")
 
     async def websocket(self, request: web.Request) -> web.WebSocketResponse:
+        remote_ip = request.remote or "unknown"
+        if not await self.reserve_connection(remote_ip):
+            raise web.HTTPTooManyRequests(text="connection limit exceeded")
+
         websocket = web.WebSocketResponse(max_msg_size=MAX_AUDIO_FRAME_BYTES + 4096)
-        await websocket.prepare(request)
 
         client: Client | None = None
         try:
+            await websocket.prepare(request)
             join_message = await websocket.receive(timeout=15)
             if join_message.type != WSMsgType.TEXT:
                 self.metrics.inc("invalid_messages")
@@ -86,9 +112,16 @@ class WebIntercomServer:
                 await websocket.close(code=4002, message=b"join type required")
                 return websocket
 
+            if await self.is_auth_rate_limited(remote_ip):
+                self.metrics.inc("auth_rate_limit_rejections")
+                await websocket.send_json({"type": "error", "message": "Too many failed room key attempts. Try again later."})
+                await websocket.close(code=4029, message=b"auth rate limited")
+                return websocket
+
             provided_key = str(payload.get("key") or "")
             if not hmac.compare_digest(provided_key, self.room_key):
                 self.metrics.inc("auth_failures")
+                await self.record_auth_failure(remote_ip)
                 await websocket.send_json({"type": "error", "message": "Invalid room key."})
                 await websocket.close(code=4003, message=b"invalid room key")
                 return websocket
@@ -98,9 +131,20 @@ class WebIntercomServer:
             client_id = self.metrics.next_client_id()
             joined_at = time.monotonic()
             client = Client(websocket=websocket, client_id=client_id, name=name, room=room, joined_at=joined_at)
-            self.start_relay_worker(client)
             async with self.lock:
-                self.clients[websocket] = client
+                if len(self.clients) >= self.max_clients:
+                    client = None
+                    self.metrics.inc("connection_limit_rejections")
+                    server_full = True
+                else:
+                    server_full = False
+                    self.clients[websocket] = client
+            if server_full:
+                await websocket.send_json({"type": "error", "message": "Server is full."})
+                await websocket.close(code=4029, message=b"server full")
+                return websocket
+            await self.clear_auth_failures(remote_ip)
+            self.start_relay_worker(client)
             self.metrics.record_join(client_id, name, room, joined_at)
             await websocket.send_json({"type": "joined", "name": name, "room": room})
             await self.broadcast_presence(room)
@@ -124,7 +168,53 @@ class WebIntercomServer:
                 self.metrics.record_leave(client.client_id)
                 await self.broadcast_presence(client.room)
                 print(f"Left {client.name} from room {client.room}")
+            await self.release_connection(remote_ip)
         return websocket
+
+    async def reserve_connection(self, remote_ip: str) -> bool:
+        async with self.lock:
+            if self.open_connections >= self.max_open_connections:
+                self.metrics.inc("connection_limit_rejections")
+                return False
+            if self.open_connections_by_ip[remote_ip] >= self.max_connections_per_ip:
+                self.metrics.inc("connection_limit_rejections")
+                return False
+            self.open_connections += 1
+            self.open_connections_by_ip[remote_ip] += 1
+            return True
+
+    async def release_connection(self, remote_ip: str) -> None:
+        async with self.lock:
+            self.open_connections = max(0, self.open_connections - 1)
+            current = max(0, self.open_connections_by_ip.get(remote_ip, 0) - 1)
+            if current:
+                self.open_connections_by_ip[remote_ip] = current
+            else:
+                self.open_connections_by_ip.pop(remote_ip, None)
+
+    async def is_auth_rate_limited(self, remote_ip: str) -> bool:
+        async with self.lock:
+            failures = self.auth_failures_by_ip.get(remote_ip)
+            if not failures:
+                return False
+            self.prune_auth_failures(failures, time.monotonic())
+            return len(failures) >= self.max_auth_failures_per_ip
+
+    async def record_auth_failure(self, remote_ip: str) -> None:
+        async with self.lock:
+            now = time.monotonic()
+            failures = self.auth_failures_by_ip[remote_ip]
+            self.prune_auth_failures(failures, now)
+            failures.append(now)
+
+    async def clear_auth_failures(self, remote_ip: str) -> None:
+        async with self.lock:
+            self.auth_failures_by_ip.pop(remote_ip, None)
+
+    def prune_auth_failures(self, failures: deque[float], now: float) -> None:
+        cutoff = now - self.auth_failure_window_seconds
+        while failures and failures[0] < cutoff:
+            failures.popleft()
 
     async def handle_audio(self, sender: Client, data: bytes) -> None:
         if not data or len(data) > MAX_AUDIO_FRAME_BYTES:
@@ -274,30 +364,36 @@ class WebIntercomServer:
     async def stats_loop(self, interval: float, metrics_xlsx: str | None) -> None:
         while True:
             await asyncio.sleep(interval)
-            async with self.lock:
-                active_clients = [
-                    (client.client_id, client.name, client.room)
-                    for client in self.clients.values()
-                ]
-            row = self.metrics.sample(active_clients)
-            if metrics_xlsx:
-                try:
-                    await self.write_metrics_workbook(metrics_xlsx)
-                except PermissionError:
-                    print(
-                        f"[metrics] Could not update {metrics_xlsx}; close it in Excel and the next interval will retry.",
-                        flush=True,
-                    )
-            print(
-                "[server stats] "
-                f"clients={row['active_clients']} "
-                f"rx_audio_packets={row['rx_audio_packets']} "
-                f"relayed_packets={row['relayed_packets']} "
-                f"rx_kbps={row['avg_rx_kbps']} "
-                f"relayed_kbps={row['avg_relayed_kbps']} "
-                f"xlsx={metrics_xlsx or 'off'}",
-                flush=True,
-            )
+            try:
+                async with self.lock:
+                    active_clients = [
+                        (client.client_id, client.name, client.room)
+                        for client in self.clients.values()
+                    ]
+                row = self.metrics.sample(active_clients)
+                if metrics_xlsx:
+                    try:
+                        await self.write_metrics_workbook(metrics_xlsx)
+                    except PermissionError:
+                        print(
+                            f"[metrics] Could not update {metrics_xlsx}; close it in Excel and the next interval will retry.",
+                            flush=True,
+                        )
+                print(
+                    "[server stats] "
+                    f"clients={row['active_clients']} "
+                    f"rx_audio_packets={row['rx_audio_packets']} "
+                    f"relayed_packets={row['relayed_packets']} "
+                    f"rx_kbps={row['avg_rx_kbps']} "
+                    f"relayed_kbps={row['avg_relayed_kbps']} "
+                    f"xlsx={metrics_xlsx or 'off'}",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(
+                    f"[stats_loop] unexpected error: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
 
     async def write_metrics_workbook(self, metrics_xlsx: str) -> None:
         server_samples, client_states = self.metrics.snapshot()
@@ -350,8 +446,20 @@ def create_app(
     static_dir: Path,
     stats_interval: float,
     metrics_xlsx: str | None = None,
+    max_clients: int = MAX_CLIENTS,
+    max_open_connections: int = MAX_OPEN_CONNECTIONS,
+    max_connections_per_ip: int = MAX_CONNECTIONS_PER_IP,
+    max_auth_failures_per_ip: int = MAX_AUTH_FAILURES_PER_IP,
+    auth_failure_window_seconds: float = AUTH_FAILURE_WINDOW_SECONDS,
 ) -> web.Application:
-    relay = WebIntercomServer(room_key)
+    relay = WebIntercomServer(
+        room_key,
+        max_clients=max_clients,
+        max_open_connections=max_open_connections,
+        max_connections_per_ip=max_connections_per_ip,
+        max_auth_failures_per_ip=max_auth_failures_per_ip,
+        auth_failure_window_seconds=auth_failure_window_seconds,
+    )
     app = web.Application()
     app[STATIC_DIR_KEY] = static_dir
     app.router.add_get("/", relay.index)
@@ -387,7 +495,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--metrics-xlsx",
         help="Write processed measurement data to this Excel workbook.",
     )
+    parser.add_argument("--max-clients", type=int, default=MAX_CLIENTS, help="Maximum authenticated clients. Default: %(default)s")
+    parser.add_argument(
+        "--max-open-connections",
+        type=int,
+        default=MAX_OPEN_CONNECTIONS,
+        help="Maximum open WebSocket handshakes/connections. Default: %(default)s",
+    )
+    parser.add_argument(
+        "--max-connections-per-ip",
+        type=int,
+        default=MAX_CONNECTIONS_PER_IP,
+        help="Maximum open WebSocket connections from one IP. Default: %(default)s",
+    )
+    parser.add_argument(
+        "--max-auth-failures-per-ip",
+        type=int,
+        default=MAX_AUTH_FAILURES_PER_IP,
+        help="Failed room-key attempts allowed per IP within the auth window. Default: %(default)s",
+    )
+    parser.add_argument(
+        "--auth-failure-window",
+        type=float,
+        default=AUTH_FAILURE_WINDOW_SECONDS,
+        help="Auth failure rate-limit window in seconds. Default: %(default)s",
+    )
     return parser
+
+
+def build_ssl_context(cert_path: Path, key_path: Path) -> ssl.SSLContext:
+    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+    ssl_context.load_cert_chain(cert_path, key_path)
+    return ssl_context
 
 
 def main(argv: Iterable[str] | None = None) -> int:
@@ -398,9 +538,18 @@ def main(argv: Iterable[str] | None = None) -> int:
     cert_hosts = ["localhost", *local_ipv4_addresses()]
     cert_path, key_path = ensure_self_signed_cert(project_dir / args.cert_dir, cert_hosts)
 
-    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ssl_context.load_cert_chain(cert_path, key_path)
-    app = create_app(room_key, static_dir, args.stats_interval, args.metrics_xlsx)
+    ssl_context = build_ssl_context(cert_path, key_path)
+    app = create_app(
+        room_key,
+        static_dir,
+        args.stats_interval,
+        args.metrics_xlsx,
+        max_clients=args.max_clients,
+        max_open_connections=args.max_open_connections,
+        max_connections_per_ip=args.max_connections_per_ip,
+        max_auth_failures_per_ip=args.max_auth_failures_per_ip,
+        auth_failure_window_seconds=args.auth_failure_window,
+    )
 
     urls = [f"https://localhost:{args.port}"]
     urls.extend(f"https://{address}:{args.port}" for address in local_ipv4_addresses() if not address.startswith("127."))

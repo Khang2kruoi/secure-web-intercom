@@ -145,69 +145,74 @@ async function connect() {
   pendingCaptureSends = 0;
   captureSessionId += 1;
   setStatus("Connecting", false);
-  audioContext = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
-  metrics.audioContextSampleRate = audioContext.sampleRate;
-  if (audioContext.audioWorklet === undefined) {
-    metrics.captureErrors += 1;
-    setStatus("AudioWorklet unavailable", false);
-    throw new Error("AudioWorklet is not supported by this browser.");
-  }
-  await audioContext.audioWorklet.addModule("/static/audio-worklet.js");
-
   try {
-    mediaStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,
-        noiseSuppression: true,
-        echoCancellation: true,
-        autoGainControl: true,
-      },
+    audioContext = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
+    metrics.audioContextSampleRate = audioContext.sampleRate;
+    if (audioContext.audioWorklet === undefined) {
+      metrics.captureErrors += 1;
+      setStatus("AudioWorklet unavailable", false);
+      throw new Error("AudioWorklet is not supported by this browser.");
+    }
+    await audioContext.audioWorklet.addModule("/static/audio-worklet.js");
+
+    try {
+      mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          noiseSuppression: true,
+          echoCancellation: true,
+          autoGainControl: true,
+        },
+      });
+    } catch (error) {
+      metrics.captureErrors += 1;
+      setStatus("Microphone blocked", false);
+      throw error;
+    }
+
+    const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    socket = new WebSocket(`${wsProtocol}//${window.location.host}/ws`);
+    socket.binaryType = "arraybuffer";
+
+    socket.addEventListener("open", () => {
+      const payload = {
+        type: "join",
+        name: document.querySelector("#name").value,
+        room: document.querySelector("#room").value,
+        key: document.querySelector("#key").value,
+      };
+      socket.send(JSON.stringify(payload));
+    });
+
+    socket.addEventListener("message", (event) => {
+      if (typeof event.data === "string") {
+        handleControlMessage(JSON.parse(event.data));
+        return;
+      }
+      metrics.receivedBytes += event.data.byteLength;
+      const packet = parseAudioPacket(event.data);
+      if (!packet) {
+        metrics.malformedAudioPackets += 1;
+        return;
+      }
+      metrics.receivedPayloadBytes += packet.payload.byteLength;
+      metrics.receivedPackets += 1;
+      metrics.packets += 1;
+      updateRfc3550Jitter(packet);
+      playPcm16(packet);
+    });
+
+    socket.addEventListener("close", () => {
+      disconnect(false);
+    });
+
+    socket.addEventListener("error", () => {
+      setStatus("Connection error", false);
     });
   } catch (error) {
-    metrics.captureErrors += 1;
-    setStatus("Microphone blocked", false);
+    cleanupFailedConnect();
     throw error;
   }
-
-  const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  socket = new WebSocket(`${wsProtocol}//${window.location.host}/ws`);
-  socket.binaryType = "arraybuffer";
-
-  socket.addEventListener("open", () => {
-    const payload = {
-      type: "join",
-      name: document.querySelector("#name").value,
-      room: document.querySelector("#room").value,
-      key: document.querySelector("#key").value,
-    };
-    socket.send(JSON.stringify(payload));
-  });
-
-  socket.addEventListener("message", (event) => {
-    if (typeof event.data === "string") {
-      handleControlMessage(JSON.parse(event.data));
-      return;
-    }
-    metrics.receivedBytes += event.data.byteLength;
-    const packet = parseAudioPacket(event.data);
-    if (!packet) {
-      metrics.malformedAudioPackets += 1;
-      return;
-    }
-    metrics.receivedPayloadBytes += packet.payload.byteLength;
-    metrics.receivedPackets += 1;
-    metrics.packets += 1;
-    updateRfc3550Jitter(packet);
-    playPcm16(packet);
-  });
-
-  socket.addEventListener("close", () => {
-    disconnect(false);
-  });
-
-  socket.addEventListener("error", () => {
-    setStatus("Connection error", false);
-  });
 }
 
 function startAudioCapture() {
@@ -300,6 +305,45 @@ function sendQosPing() {
       client_time_ms: performance.now(),
     }),
   );
+}
+
+function cleanupFailedConnect() {
+  if (socket) {
+    socket.close();
+    socket = null;
+  }
+  if (workletNode) {
+    workletNode.port.onmessage = null;
+    workletNode.disconnect();
+    workletNode = null;
+  }
+  if (silenceGainNode) {
+    silenceGainNode.disconnect();
+    silenceGainNode = null;
+  }
+  if (sourceNode) {
+    sourceNode.disconnect();
+    sourceNode = null;
+  }
+  if (mediaStream) {
+    for (const track of mediaStream.getTracks()) {
+      track.stop();
+    }
+    mediaStream = null;
+  }
+  for (const state of remoteStreams.values()) {
+    stopActiveNodes(state);
+  }
+  if (audioContext) {
+    audioContext.close();
+    audioContext = null;
+  }
+  captureSendChain = Promise.resolve();
+  pendingCaptureSends = 0;
+  captureSessionId += 1;
+  remoteStreams = new Map();
+  joinButton.disabled = false;
+  leaveButton.disabled = true;
 }
 
 function disconnect(closeSocket = true) {

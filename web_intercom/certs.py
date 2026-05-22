@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import ipaddress
+import os
 from pathlib import Path
 import socket
 
@@ -39,9 +40,11 @@ def local_ipv4_addresses() -> list[str]:
 
 def ensure_self_signed_cert(cert_dir: Path, hosts: list[str]) -> tuple[Path, Path]:
     cert_dir.mkdir(parents=True, exist_ok=True)
+    _chmod_best_effort(cert_dir, 0o700)
     cert_path = cert_dir / "web_intercom.crt"
     key_path = cert_dir / "web_intercom.key"
     if cert_path.exists() and key_path.exists():
+        _chmod_best_effort(key_path, 0o600)
         return cert_path, key_path
 
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -76,11 +79,31 @@ def ensure_self_signed_cert(cert_dir: Path, hosts: list[str]) -> tuple[Path, Pat
     )
 
     cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
-    key_path.write_bytes(
+    _write_private_key(
+        key_path,
         key.private_bytes(
             serialization.Encoding.PEM,
             serialization.PrivateFormat.TraditionalOpenSSL,
             serialization.NoEncryption(),
-        )
+        ),
     )
     return cert_path, key_path
+
+
+def _write_private_key(path: Path, data: bytes) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            fd = -1
+            handle.write(data)
+    finally:
+        if fd != -1:
+            os.close(fd)
+    _chmod_best_effort(path, 0o600)
+
+
+def _chmod_best_effort(path: Path, mode: int) -> None:
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass

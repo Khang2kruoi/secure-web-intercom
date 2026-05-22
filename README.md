@@ -8,8 +8,9 @@ This is the browser-client version of the secure LAN voice intercom. Client mach
 - Browsers connect through WebSocket Secure (`wss://`).
 - Each browser captures microphone audio with `AudioWorklet`, requests a 16 kHz `AudioContext`, resamples captured frames to 16 kHz if the hardware forces a different rate, converts frames to PCM16, and sends them to the server.
 - Each browser keeps an independent playout clock per remote stream, so simultaneous talkers are mixed by the Web Audio graph instead of being serialized into one global queue.
-- The server relays each client's audio to the other clients in the same room, with per-recipient send timeouts so one slow browser does not stall the whole room.
-- Transport security comes from HTTPS/WSS. A room key is required before a client can join.
+- The server relays each client's audio to the other clients in the same room, with bounded per-recipient queues and send timeouts so one slow browser does not stall the whole room.
+- Transport security comes from HTTPS/WSS with TLS 1.2 or newer. A room key is required before a client can join.
+- The server limits total clients, open WebSocket connections, per-IP connections, and repeated failed room-key attempts.
 
 ## Setup on the Server Machine
 
@@ -23,6 +24,12 @@ python -m pip install -r requirements.txt
 ```powershell
 $env:WEB_INTERCOM_KEY = "change-this-demo-secret"
 python -m web_intercom.server --host 0.0.0.0 --port 8443
+```
+
+Optional resource limits are available for demos with many browsers:
+
+```powershell
+python -m web_intercom.server --host 0.0.0.0 --port 8443 --max-clients 20 --max-open-connections 40 --max-connections-per-ip 8 --max-auth-failures-per-ip 5
 ```
 
 In this example, the room key is:
@@ -136,7 +143,9 @@ New-NetFirewallRule -DisplayName "Secure Web Intercom HTTPS 8443" -Direction Inb
 
 - This version is for LAN demos, not public internet deployment.
 - Browser microphone access requires HTTPS.
-- The generated certificate is self-signed, so clients must accept the browser warning once.
+- The generated certificate is self-signed, so clients must accept the browser warning once. The private key is written with restrictive file permissions where the operating system supports them.
+- The HTTPS server enforces TLS 1.2 or newer.
+- The server rejects excess connections and rate-limits repeated failed room-key attempts per IP.
 - Audio is relayed by the server; the server can access the audio stream.
 - Audio capture uses `AudioWorklet` instead of the deprecated `ScriptProcessorNode`, so capture work is isolated from the browser UI thread.
 - The client requests `AudioContext({ sampleRate: 16000 })`. If the actual `AudioContext.sampleRate` differs, captured audio is resampled to 16 kHz with `OfflineAudioContext` before transmission. Received PCM16 is placed in a 16 kHz `AudioBuffer` so the browser performs playback resampling instead of nearest-neighbor JavaScript scaling.

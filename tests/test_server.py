@@ -1,15 +1,24 @@
 import asyncio
+import os
+import ssl
 import time
+from unittest.mock import patch
 
 from openpyxl import load_workbook
 
+from web_intercom.certs import ensure_self_signed_cert
 from web_intercom.metrics import derive_client_qoe_metrics, estimate_e_model
 from web_intercom.server import (
     Client,
+    MAX_AUTH_FAILURES_PER_IP,
+    MAX_CLIENTS,
+    MAX_CONNECTIONS_PER_IP,
+    MAX_OPEN_CONNECTIONS,
     RELAY_QUEUE_MAX_PACKETS,
     WebIntercomServer,
     audio_payload_size,
     audio_stream_id,
+    build_ssl_context,
     build_arg_parser,
     create_app,
     load_room_key,
@@ -23,6 +32,11 @@ def test_parser_defaults():
     assert args.port == 8443
     assert args.stats_interval == 5.0
     assert args.metrics_xlsx is None
+    assert args.max_clients == MAX_CLIENTS
+    assert args.max_open_connections == MAX_OPEN_CONNECTIONS
+    assert args.max_connections_per_ip == MAX_CONNECTIONS_PER_IP
+    assert args.max_auth_failures_per_ip == MAX_AUTH_FAILURES_PER_IP
+    assert args.auth_failure_window == 60.0
 
 
 def test_load_room_key_from_value():
@@ -56,6 +70,93 @@ def test_audio_packet_header_validation():
     assert audio_payload_size(b"SWI1") is None
     packet = b"SWI1" + (123456).to_bytes(4, "big") + b"\x00" * 12 + b"pcm"
     assert audio_stream_id(packet) == 123456
+
+
+def test_generated_private_key_uses_restrictive_open_mode(tmp_path):
+    real_open = os.open
+    modes = []
+
+    def tracking_open(path, flags, mode=0o777):
+        modes.append(mode)
+        return real_open(path, flags, mode)
+
+    with patch("web_intercom.certs.os.open", tracking_open):
+        cert_path, key_path = ensure_self_signed_cert(tmp_path / "certs", ["127.0.0.1"])
+
+    assert cert_path.exists()
+    assert key_path.exists()
+    assert 0o600 in modes
+
+
+def test_ssl_context_requires_tls_1_2_or_newer(tmp_path):
+    cert_path, key_path = ensure_self_signed_cert(tmp_path / "certs", ["127.0.0.1"])
+
+    context = build_ssl_context(cert_path, key_path)
+
+    assert context.minimum_version == ssl.TLSVersion.TLSv1_2
+
+
+def test_connection_reservation_limits_total_and_per_ip():
+    async def run() -> None:
+        relay = WebIntercomServer("secret", max_open_connections=2, max_connections_per_ip=1)
+
+        assert await relay.reserve_connection("10.0.0.2")
+        assert not await relay.reserve_connection("10.0.0.2")
+        assert await relay.reserve_connection("10.0.0.3")
+        assert not await relay.reserve_connection("10.0.0.4")
+        await relay.release_connection("10.0.0.2")
+        assert await relay.reserve_connection("10.0.0.4")
+
+    asyncio.run(run())
+
+
+def test_auth_failure_rate_limit_and_clear():
+    async def run() -> None:
+        relay = WebIntercomServer(
+            "secret",
+            max_auth_failures_per_ip=2,
+            auth_failure_window_seconds=60,
+        )
+        remote_ip = "10.0.0.2"
+
+        assert not await relay.is_auth_rate_limited(remote_ip)
+        await relay.record_auth_failure(remote_ip)
+        await relay.record_auth_failure(remote_ip)
+        assert await relay.is_auth_rate_limited(remote_ip)
+        await relay.clear_auth_failures(remote_ip)
+        assert not await relay.is_auth_rate_limited(remote_ip)
+
+    asyncio.run(run())
+
+
+def test_stats_loop_logs_and_continues_after_unexpected_error(capfd):
+    async def run() -> int:
+        relay = WebIntercomServer("secret")
+        original_sample = relay.metrics.sample
+        calls = 0
+
+        def flaky_sample(active_clients):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise ValueError("boom")
+            return original_sample(active_clients)
+
+        relay.metrics.sample = flaky_sample
+        task = asyncio.create_task(relay.stats_loop(0.01, None))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return calls
+
+    calls = asyncio.run(run())
+    output = capfd.readouterr().out
+
+    assert calls >= 2
+    assert "[stats_loop] unexpected error: ValueError: boom" in output
 
 
 def test_handle_audio_does_not_block_on_slow_recipient():
