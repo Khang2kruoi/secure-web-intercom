@@ -109,6 +109,7 @@ The workbook is updated every reporting interval and contains:
 Browsers automatically send client-side measurement data to the server. You do not need to install anything on client machines.
 
 Workbook generation runs in a separate process so report writing does not compete with the server event loop for Python's GIL during audio relay.
+The front sheets intentionally show processed QoS/QoE indicators instead of raw byte dumps. Detailed packet and browser samples remain available on the `Samples` and `Client Samples` sheets for audit work.
 
 Do not keep the workbook open in Excel while the server is running. Windows may lock the file; if that happens, close Excel and the next reporting interval will retry the update.
 

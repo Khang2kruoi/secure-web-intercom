@@ -485,12 +485,11 @@ def write_metrics_workbook(
     _build_samples(samples, server_samples, Table, TableStyleInfo, Font, PatternFill)
     _build_client_samples(client_samples, client_states, Table, TableStyleInfo, Font, PatternFill)
     _build_guide(guide, Font, PatternFill)
-    _add_bitrate_chart(summary, samples, len(server_samples), LineChart, Reference)
-    _add_qos_chart(qos_summary, samples, len(server_samples), LineChart, Reference)
+    _add_qos_chart(qos_summary, server_samples, LineChart, Reference)
 
     for sheet in workbook.worksheets:
         sheet.sheet_view.showGridLines = False
-        sheet.freeze_panes = "A4"
+        sheet.freeze_panes = "A5"
         _size_columns(sheet, Alignment)
 
     temp_path = path.with_name(f"{path.stem}.tmp{path.suffix}")
@@ -509,35 +508,28 @@ def _build_summary(sheet: object, latest: MetricRow, rows: list[MetricRow], clie
         ("Sample count", len(rows), "samples", "Number of server-side measurement intervals saved."),
         ("Active clients", _as_int(latest.get("active_clients")), "clients", "Browsers connected at the latest sample."),
         ("Active rooms", _as_int(latest.get("active_rooms")), "rooms", "Rooms currently in use."),
+        ("Total clients seen", len(clients), "clients", "Unique browser connections during the run."),
         ("Total joins", _as_int(latest.get("join_events")), "events", "Successful browser connections."),
         ("Authentication failures", _as_int(latest.get("auth_failures")), "events", "Rejected attempts due to wrong room key."),
         ("Auth rate-limit rejections", _as_int(latest.get("auth_rate_limit_rejections")), "events", "Rejected attempts after an IP exceeded the failed room-key attempt limit."),
         ("Connection limit rejections", _as_int(latest.get("connection_limit_rejections")), "events", "Rejected WebSocket attempts due to server or per-IP connection limits."),
-        ("Audio received", _mb(latest.get("rx_audio_bytes")), "MB", "Audio network bytes received from browsers, including application headers."),
-        ("Audio relayed", _mb(latest.get("relayed_bytes")), "MB", "Audio network bytes forwarded to other browsers, including application headers."),
-        ("PCM payload received", _mb(latest.get("rx_audio_payload_bytes")), "MB", "PCM16 payload received from browsers, excluding application headers."),
-        ("PCM payload relayed", _mb(latest.get("relayed_payload_bytes")), "MB", "PCM16 payload forwarded to browsers, excluding application headers."),
-        ("Average receive bitrate", _as_float(latest.get("avg_rx_kbps")), "kbps", "Average inbound audio rate since start."),
         ("Average payload receive bitrate", _as_float(latest.get("avg_rx_payload_kbps")), "kbps", "Average inbound PCM16 payload rate since start."),
-        ("Average relay bitrate", _as_float(latest.get("avg_relayed_kbps")), "kbps", "Average server forwarding rate since start."),
         ("Average payload relay bitrate", _as_float(latest.get("avg_relayed_payload_kbps")), "kbps", "Average forwarded PCM16 payload rate since start."),
-        ("Peak interval receive bitrate", _max(rows, "interval_rx_kbps"), "kbps", "Highest inbound audio bitrate in any measurement interval."),
-        ("Peak interval relay bitrate", _max(rows, "interval_relayed_kbps"), "kbps", "Highest forwarding bitrate in any measurement interval."),
+        ("Peak interval payload receive bitrate", _max(rows, "interval_rx_payload_kbps"), "kbps", "Highest inbound PCM16 payload bitrate in any interval."),
+        ("Peak interval payload relay bitrate", _max(rows, "interval_relayed_payload_kbps"), "kbps", "Highest forwarded PCM16 payload bitrate in any interval."),
+        ("Audio packets received", _as_int(latest.get("rx_audio_packets")), "packets", "Binary audio packets accepted by the server."),
+        ("Audio packets relayed", _as_int(latest.get("relayed_packets")), "packets", "Audio packets forwarded to room recipients."),
         ("Relay send drops", _as_int(latest.get("relay_send_drops")), "packets", "Outbound packets dropped to prevent a slow recipient from blocking the relay loop."),
-        ("Browser sent audio", _mb(latest.get("browser_sent_bytes")), "MB", "Client-reported microphone audio uploaded."),
-        ("Browser received audio", _mb(latest.get("browser_received_bytes")), "MB", "Client-reported audio downloaded for playback."),
-        ("Browser playback packets", _as_int(latest.get("browser_played_packets")), "packets", "Client-reported received packets scheduled for speakers."),
         ("Estimated OWD", _as_float(latest.get("browser_avg_estimated_owd_ms")), "ms", "Latest average RTT/2 one-way delay estimate from browsers."),
+        ("Estimated playout latency", _as_float(latest.get("browser_avg_playout_latency_ms")), "ms", "Average client playout latency estimate including RTT/2 and queue delay."),
         ("Max RFC3550 jitter", _as_float(latest.get("browser_max_jitter_ms")), "ms", "Latest worst browser inter-arrival jitter estimate."),
         ("Average estimated MOS", _as_float(latest.get("browser_avg_estimated_mos")), "MOS", "Latest objective QoE estimate from browser metrics."),
+        ("Minimum estimated MOS", _as_float(latest.get("browser_min_estimated_mos")), "MOS", "Worst current objective QoE estimate among active browsers."),
         ("Network sequence gaps", _as_int(latest.get("browser_network_loss_packets")), "packets", "Client-estimated missing packets from stream sequence gaps."),
         ("Late dropped packets", _as_int(latest.get("browser_late_dropped_packets")), "packets", "Browser packets actually dropped because per-stream queue pressure exceeded the configured budget."),
-        ("Browser resampled frames", _as_int(latest.get("browser_resampled_frames")), "frames", "Captured frames resampled to 16 kHz before transmission."),
-        ("Audio context sample rate", _as_float(latest.get("browser_max_audio_context_sample_rate")), "Hz", "Largest actual browser AudioContext sample rate observed among active clients."),
         ("Buffer underrun events", _as_int(latest.get("browser_buffer_underrun_events")), "events", "Browser playout starvation events."),
         ("Dropped audio frames", _as_int(latest.get("dropped_audio_frames")), "frames", "Frames rejected by server validation."),
         ("Browser capture errors", _as_int(latest.get("browser_capture_errors")), "events", "Capture errors reported by browsers."),
-        ("Total clients seen", len(clients), "clients", "Unique browser connections during the run."),
     ]
     for index, row in enumerate(summary_rows, start=5):
         _write_row(sheet, index, row)
@@ -631,14 +623,13 @@ def _build_jitter_cdf(sheet: object, clients: list[ClientMetricState], chart_cls
         _write_row(sheet, row_index, [percentile, _percentile(values, percentile)])
 
     chart = chart_cls()
-    chart.title = "Jitter CDF"
-    chart.y_axis.title = "Jitter (ms)"
-    chart.x_axis.title = "Percentile"
+    _format_line_chart(chart, "Jitter CDF", "Jitter (ms)", "Percentile")
     data = reference_cls(sheet, min_col=2, max_col=2, min_row=4, max_row=len(percentiles) + 4)
     chart.add_data(data, titles_from_data=True)
     categories = reference_cls(sheet, min_col=1, min_row=5, max_row=len(percentiles) + 4)
     chart.set_categories(categories)
-    sheet.add_chart(chart, "D4")
+    _style_chart_series(chart, ["4472C4"])
+    sheet.add_chart(chart, "D5")
 
 
 def _build_assessment(sheet: object, latest: MetricRow, clients: list[ClientMetricState], font_cls: object, fill_cls: object) -> None:
@@ -687,15 +678,10 @@ def _build_client_summary(sheet: object, clients: list[ClientMetricState], table
         "name",
         "room",
         "status",
-        "uptime_seconds",
         "session_duration_seconds",
         "captured_frames",
         "sent_packets",
-        "sent_bytes",
-        "sent_payload_bytes",
         "received_packets",
-        "received_bytes",
-        "received_payload_bytes",
         "played_packets",
         "capture_errors",
         "malformed_audio_packets",
@@ -719,9 +705,6 @@ def _build_client_summary(sheet: object, clients: list[ClientMetricState], table
         "capture_queue_dropped_frames",
         "active_remote_streams",
         "callback_interval_stddev_ms",
-        "worklet_message_interval_stddev_ms",
-        "last_sent_kbps",
-        "last_rx_kbps",
         "playback_queue_seconds",
     ]
     _write_table(sheet, fields, [_client_summary_row(client) for client in clients], table_cls, style_cls, font_cls, fill_cls)
@@ -741,41 +724,24 @@ def _build_samples(sheet: object, rows: list[MetricRow], table_cls: object, styl
         "connection_limit_rejections",
         "invalid_messages",
         "rx_audio_packets",
-        "rx_audio_bytes",
-        "rx_audio_payload_bytes",
         "relayed_packets",
-        "relayed_bytes",
-        "relayed_payload_bytes",
         "relay_send_drops",
         "dropped_audio_frames",
-        "avg_rx_kbps",
         "avg_rx_payload_kbps",
-        "avg_relayed_kbps",
         "avg_relayed_payload_kbps",
-        "interval_rx_kbps",
         "interval_rx_payload_kbps",
-        "interval_relayed_kbps",
         "interval_relayed_payload_kbps",
         "interval_rx_pps",
         "interval_relayed_pps",
-        "browser_captured_frames",
         "browser_sent_packets",
-        "browser_sent_bytes",
-        "browser_sent_payload_bytes",
         "browser_received_packets",
-        "browser_received_bytes",
-        "browser_received_payload_bytes",
         "browser_played_packets",
         "browser_capture_errors",
-        "browser_malformed_audio_packets",
         "browser_network_loss_packets",
         "browser_late_dropped_packets",
-        "browser_queue_overflow_dropped_packets",
         "browser_buffer_underrun_events",
         "browser_buffer_underrun_seconds",
-        "browser_max_buffer_underrun_ms",
         "browser_avg_rtt_ms",
-        "browser_max_rtt_ms",
         "browser_avg_estimated_owd_ms",
         "browser_max_jitter_ms",
         "browser_avg_playout_latency_ms",
@@ -783,7 +749,6 @@ def _build_samples(sheet: object, rows: list[MetricRow], table_cls: object, styl
         "browser_min_estimated_mos",
         "browser_max_callback_stddev_ms",
         "browser_resampled_frames",
-        "browser_capture_queue_dropped_frames",
         "browser_max_audio_context_sample_rate",
         "browser_max_active_remote_streams",
     ]
@@ -872,45 +837,88 @@ def _client_summary_row(client: ClientMetricState) -> MetricRow:
     }
 
 
-def _add_bitrate_chart(summary: object, samples: object, row_count: int, chart_cls: object, reference_cls: object) -> None:
-    if row_count < 2:
+def _add_qos_chart(qos_summary: object, rows: list[MetricRow], chart_cls: object, reference_cls: object) -> None:
+    if len(rows) < 2:
         return
+    helper_start_row = 4
+    helper_start_col = 7
+    headers = ["Sample", "OWD ms", "Jitter ms", "Latency ms"]
+    for offset, value in enumerate(headers):
+        qos_summary.cell(helper_start_row, helper_start_col + offset, value)
+    for row_index, sample in enumerate(rows, start=helper_start_row + 1):
+        qos_summary.cell(row_index, helper_start_col, row_index - helper_start_row)
+        qos_summary.cell(row_index, helper_start_col + 1, _as_float(sample.get("browser_avg_estimated_owd_ms")))
+        qos_summary.cell(row_index, helper_start_col + 2, _as_float(sample.get("browser_max_jitter_ms")))
+        qos_summary.cell(row_index, helper_start_col + 3, _as_float(sample.get("browser_avg_playout_latency_ms")))
+    for column_index in range(helper_start_col, helper_start_col + len(headers)):
+        qos_summary.column_dimensions[_column_letter(column_index)].hidden = True
+
     chart = chart_cls()
-    chart.title = "Interval Bitrate Trend"
-    chart.y_axis.title = "kbps"
-    chart.x_axis.title = "sample"
-    for column in (20, 22):
-        data = reference_cls(samples, min_col=column, max_col=column, min_row=4, max_row=row_count + 4)
-        chart.add_data(data, titles_from_data=True)
-    summary.add_chart(chart, "F4")
+    _format_line_chart(chart, "QoS Delay Trend", "Milliseconds", "Sample")
+    data = reference_cls(
+        qos_summary,
+        min_col=helper_start_col + 1,
+        max_col=helper_start_col + 3,
+        min_row=helper_start_row,
+        max_row=helper_start_row + len(rows),
+    )
+    categories = reference_cls(
+        qos_summary,
+        min_col=helper_start_col,
+        min_row=helper_start_row + 1,
+        max_row=helper_start_row + len(rows),
+    )
+    chart.add_data(data, titles_from_data=True)
+    chart.set_categories(categories)
+    _style_chart_series(chart, ["4472C4", "70AD47", "C00000"])
+    qos_summary.add_chart(chart, "F5")
 
 
-def _add_qos_chart(qos_summary: object, samples: object, row_count: int, chart_cls: object, reference_cls: object) -> None:
-    if row_count < 2:
-        return
-    chart = chart_cls()
-    chart.title = "QoS Trend"
-    chart.y_axis.title = "ms"
-    chart.x_axis.title = "sample"
-    for column in (43, 44, 45):
-        data = reference_cls(samples, min_col=column, max_col=column, min_row=4, max_row=row_count + 4)
-        chart.add_data(data, titles_from_data=True)
-    qos_summary.add_chart(chart, "F4")
+def _format_line_chart(chart: object, title: str, y_title: str, x_title: str) -> None:
+    chart.title = title
+    chart.style = 13
+    chart.height = 7.0
+    chart.width = 12.5
+    chart.y_axis.title = y_title
+    chart.x_axis.title = x_title
+    chart.legend.position = "b"
+    chart.y_axis.numFmt = "0.0"
+    chart.x_axis.majorGridlines = None
+    chart.y_axis.majorGridlines = None
+
+
+def _style_chart_series(chart: object, colors: list[str]) -> None:
+    for series, color in zip(chart.series, colors):
+        series.graphicalProperties.line.solidFill = color
+        series.graphicalProperties.line.width = 22000
 
 
 def _title(sheet: object, title: str, font_cls: object, fill_cls: object) -> None:
+    from openpyxl.styles import Alignment
+
     sheet["A1"] = title
     sheet["A2"] = "Processed measurement workbook for browser-based secure LAN intercom."
     sheet["A1"].font = font_cls(size=16, bold=True, color="FFFFFF")
     sheet["A1"].fill = fill_cls("solid", fgColor="1F4E78")
-    sheet.merge_cells("A1:D1")
+    sheet["A1"].alignment = Alignment(horizontal="left", vertical="center")
+    sheet["A2"].font = font_cls(size=10, italic=True, color="404040")
+    sheet["A2"].fill = fill_cls("solid", fgColor="EAF2F8")
+    sheet["A2"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    sheet.merge_cells("A1:H1")
+    sheet.merge_cells("A2:H2")
+    sheet.row_dimensions[1].height = 28
+    sheet.row_dimensions[2].height = 34
 
 
 def _style_header(sheet: object, range_name: str, font_cls: object, fill_cls: object) -> None:
+    from openpyxl.styles import Alignment
+
     for row in sheet[range_name]:
         for cell in row:
             cell.font = font_cls(bold=True, color="FFFFFF")
-            cell.fill = fill_cls("solid", fgColor="4472C4")
+            cell.fill = fill_cls("solid", fgColor="2F5597")
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            sheet.row_dimensions[cell.row].height = 22
 
 
 def _size_columns(sheet: object, alignment_cls: object) -> None:
@@ -918,18 +926,25 @@ def _size_columns(sheet: object, alignment_cls: object) -> None:
 
     for column_index in range(1, sheet.max_column + 1):
         letter = get_column_letter(column_index)
+        if sheet.column_dimensions[letter].hidden:
+            continue
         width = max(
             len(str(sheet.cell(row_index, column_index).value))
             if sheet.cell(row_index, column_index).value is not None
             else 0
             for row_index in range(1, sheet.max_row + 1)
         )
-        sheet.column_dimensions[letter].width = min(max(width + 2, 12), 48)
+        cap = 72 if column_index in (4, 5) else 34
+        sheet.column_dimensions[letter].width = min(max(width + 2, 12), cap)
     for row in sheet.iter_rows():
         for cell in row:
-            cell.alignment = alignment_cls(vertical="top", wrap_text=True)
+            if cell.row not in (1, 2, 4):
+                cell.alignment = alignment_cls(vertical="top", wrap_text=True)
             if isinstance(cell.value, float):
                 cell.number_format = "0.000"
+    sheet.row_dimensions[1].height = 28
+    sheet.row_dimensions[2].height = 34
+    sheet.row_dimensions[3].height = 8
 
 
 def _write_row(sheet: object, row_index: int, values: list[object] | tuple[object, ...]) -> None:

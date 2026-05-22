@@ -410,6 +410,7 @@ def test_metrics_workbook_contains_processed_sheets(tmp_path):
     relay.metrics.record_audio_in(660, 640)
     relay.metrics.record_audio_relay(660, 640)
     relay.metrics.sample([("client-0001", "alice", "main")])
+    relay.metrics.sample([("client-0001", "alice", "main")])
     output = tmp_path / "web_metrics.xlsx"
 
     relay.metrics.write_workbook(output)
@@ -427,10 +428,20 @@ def test_metrics_workbook_contains_processed_sheets(tmp_path):
         "Metric Guide",
     ]
     assert workbook["Summary"]["A1"].value == "Secure Web Intercom Measurement Summary"
+    assert workbook["Summary"].row_dimensions[1].height >= 28
+    assert workbook["Summary"].freeze_panes == "A5"
+    assert len(workbook["Summary"]._charts) == 0
+    summary_labels = [cell.value for cell in workbook["Summary"]["A"]]
+    assert "Audio received" not in summary_labels
     assert workbook["QoS Summary"]["A1"].value == "Application-Level QoS Summary"
+    assert len(workbook["QoS Summary"]._charts) == 1
     assert workbook["QoE Summary"]["A1"].value == "QoE and E-Model Summary"
     assert workbook["Client Summary"]["A4"].value == "client_id"
     assert workbook["Samples"]["A4"].value == "timestamp"
+    sample_headers = [cell.value for cell in workbook["Samples"][4]]
+    assert "rx_audio_bytes" not in sample_headers
+    assert "relayed_bytes" not in sample_headers
+    assert "browser_sent_bytes" not in sample_headers
     assert workbook["Metric Guide"]["A4"].value == "Source"
 
 
