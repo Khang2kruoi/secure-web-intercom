@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import shutil
 import socket
 import subprocess
 
@@ -67,9 +68,10 @@ def find_tailscale_cert(hostname: str, cert_dir: str | Path | None = None) -> tu
 
 
 def _tailscale_status_json() -> dict[str, object]:
+    tailscale_command = _tailscale_command()
     try:
         result = subprocess.run(
-            ["tailscale", "status", "--json"],
+            [tailscale_command, "status", "--json"],
             check=True,
             capture_output=True,
             text=True,
@@ -81,3 +83,18 @@ def _tailscale_status_json() -> dict[str, object]:
         raise RuntimeError(f"tailscale status --json failed: {stderr}") from exc
     return json.loads(result.stdout)
 
+
+def _tailscale_command() -> str:
+    command = shutil.which("tailscale")
+    if command:
+        return command
+
+    windows_candidates = [
+        Path("C:/Program Files/Tailscale/tailscale.exe"),
+        Path("C:/Program Files (x86)/Tailscale/tailscale.exe"),
+    ]
+    for candidate in windows_candidates:
+        if candidate.exists():
+            return str(candidate)
+
+    return "tailscale"

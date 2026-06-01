@@ -59,62 +59,91 @@ https://192.168.3.202:8443
 
 Open the LAN URL on client machines using Chrome or Edge. The first visit will show a self-signed certificate warning. Continue to the site, then allow microphone access.
 
-## Recommended Internet Demo: Tailscale + WebRTC
+## Recommended Internet Demo: Windows 11 + Tailscale + WebRTC
 
-Use this when clients are in different locations over the internet. Ubuntu is the cleanest server target; Windows works well as a browser client.
+Use this when clients are in different locations over the internet and you want the whole setup to run on Windows 11. The Windows 11 server runs Python, Tailscale, and the intercom server. Client machines only need Tailscale and a browser.
 
-### 1. Install Tailscale on the Ubuntu server
+### 1. Install prerequisites on the Windows 11 server
 
-```bash
-curl -fsSL https://tailscale.com/install.sh | sh
-sudo tailscale up
-tailscale status
+Install:
+
+- Python 3.12 from `https://www.python.org/downloads/windows/`
+- Git for Windows from `https://git-scm.com/download/win`
+- Tailscale from `https://tailscale.com/download/windows`
+
+Log in to Tailscale on the server using the same account or organization that the clients will use.
+
+Open PowerShell and verify that Tailscale is connected:
+
+```powershell
+$TAILSCALE = (Get-Command tailscale -ErrorAction SilentlyContinue).Source
+if (-not $TAILSCALE) { $TAILSCALE = "C:\Program Files\Tailscale\tailscale.exe" }
+& $TAILSCALE status
 ```
+
+If PowerShell cannot find `tailscale`, restart PowerShell after installing Tailscale. The server also checks the standard Windows install path `C:\Program Files\Tailscale\tailscale.exe`.
+
+### 2. Enable Tailscale DNS and HTTPS certificates
 
 In the Tailscale admin console, enable:
 
 - MagicDNS
 - HTTPS Certificates
 
-Then create the server certificate:
+Then create a Tailscale HTTPS certificate on the Windows 11 server:
 
-```bash
-TS_HOSTNAME=$(tailscale status --json | python3 -c "import sys,json; print(json.load(sys.stdin)['Self']['DNSName'].rstrip('.'))")
-sudo tailscale cert "$TS_HOSTNAME"
+```powershell
+$TAILSCALE = (Get-Command tailscale -ErrorAction SilentlyContinue).Source
+if (-not $TAILSCALE) { $TAILSCALE = "C:\Program Files\Tailscale\tailscale.exe" }
+$ts = & $TAILSCALE status --json | ConvertFrom-Json
+$TS_HOSTNAME = $ts.Self.DNSName.TrimEnd(".")
+New-Item -ItemType Directory -Force certs\tailscale | Out-Null
+Push-Location certs\tailscale
+& $TAILSCALE cert $TS_HOSTNAME
+Pop-Location
 ```
 
-Tailscale stores or writes a certificate pair named:
+This creates:
 
 ```text
-<hostname>.crt
-<hostname>.key
+certs\tailscale\<hostname>.crt
+certs\tailscale\<hostname>.key
 ```
 
-The server searches the current directory, common Tailscale certificate directories, and `--tailscale-cert-dir` if provided. Keep the private key readable only by the server user. Do not make the key world-readable.
+Keep the `.key` file private. Do not upload `certs\` to GitHub.
 
-If the certificate was created under `/var/lib/tailscale/certs` and your normal user cannot read the private key, copy it into a local protected folder instead of changing it to world-readable:
+### 3. Install the intercom project on the Windows 11 server
 
-```bash
-mkdir -p certs/tailscale
-sudo install -m 644 -o "$USER" -g "$USER" "/var/lib/tailscale/certs/$TS_HOSTNAME.crt" "certs/tailscale/$TS_HOSTNAME.crt"
-sudo install -m 600 -o "$USER" -g "$USER" "/var/lib/tailscale/certs/$TS_HOSTNAME.key" "certs/tailscale/$TS_HOSTNAME.key"
+```powershell
+git clone https://github.com/Khang2kruoi/secure-web-intercom.git
+cd secure-web-intercom
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
 ```
 
-### 2. Run the intercom bound to the Tailscale IP
+If PowerShell blocks virtual-environment activation, run only for the current terminal:
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-export WEB_INTERCOM_KEY="change-this-demo-secret"
-python -m web_intercom.server --tailscale --tailscale-cert-dir certs/tailscale --port 8443
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
 ```
 
-If your cert files are in a custom directory:
+### 4. Allow the server port through Windows Firewall
 
-```bash
-python -m web_intercom.server --tailscale --tailscale-cert-dir /path/to/certs --port 8443
+Run PowerShell as Administrator:
+
+```powershell
+New-NetFirewallRule -DisplayName "Secure Web Intercom Tailscale 8443" -Direction Inbound -Protocol TCP -LocalPort 8443 -Action Allow
+```
+
+### 5. Run the intercom bound to the Tailscale IP
+
+In the project folder:
+
+```powershell
+$env:WEB_INTERCOM_KEY = "change-this-demo-secret"
+python -m web_intercom.server --tailscale --tailscale-cert-dir certs\tailscale --port 8443
 ```
 
 The server prints a URL like:
@@ -123,31 +152,35 @@ The server prints a URL like:
 https://server-name.tailxxxx.ts.net:8443
 ```
 
-Only devices inside the tailnet should be able to reach it. The Python server binds to the Tailscale `100.x.y.z` address instead of `0.0.0.0`.
+Only devices inside the tailnet should be able to reach it. In this mode, the Python server binds to the Tailscale `100.x.y.z` address instead of `0.0.0.0`, and the browser should not show a certificate warning because the `*.ts.net` certificate is valid.
 
-### 3. Install Tailscale on each client
+### 6. Connect Windows clients
 
-Install Tailscale from `https://tailscale.com/download`, log in to the same tailnet, then open the printed `https://*.ts.net:8443` URL in Chrome or Edge.
+On every client machine:
 
-In the browser:
+1. Install Tailscale from `https://tailscale.com/download/windows`.
+2. Log in to the same tailnet.
+3. Open PowerShell and confirm the server appears in `tailscale status`.
+4. Open the printed `https://*.ts.net:8443` URL in Chrome or Edge.
+5. Enter a display name.
+6. Use the same room name, for example `main`.
+7. Enter the same room key, for example `change-this-demo-secret`.
+8. Keep media mode as `WebRTC P2P`.
+9. Click `Connect` and allow microphone access.
 
-1. Enter display name.
-2. Use the same room name, for example `main`.
-3. Enter the same room key.
-4. Keep media mode as `WebRTC P2P`.
-5. Click `Connect` and allow microphone access.
+If WebRTC cannot establish a P2P path in a specific browser/network combination, switch media mode to `WSS relay fallback`.
 
-If WebRTC cannot establish a P2P path in a specific network/browser combination, switch media mode to `WSS relay fallback`.
+### 7. Optional Tailscale ACL
 
-### 4. Optional Tailscale ACL
+Restrict access so only approved client devices can reach the server port.
 
-Restrict access so only approved client devices can reach the server port:
+If you use this ACL model, advertise tags after `tagOwners` is configured in the Tailscale admin console. Run PowerShell as Administrator on the Windows 11 server:
 
-If you use this ACL model, advertise tags after `tagOwners` is configured in the Tailscale admin console:
-
-```bash
-sudo tailscale up --advertise-tags=tag:intercom-server
+```powershell
+tailscale up --advertise-tags=tag:intercom-server
 ```
+
+Example ACL:
 
 ```json
 {
